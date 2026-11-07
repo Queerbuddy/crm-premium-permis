@@ -1,0 +1,23 @@
+# Réveil quotidien : évite que le projet Supabase gratuit se mette en veille
+# (pause après 7 jours sans activité). Lit l'adresse et la clé publique dans config.js.
+# Rien à régler : ça marche dès que config.js est rempli et le dépôt publié sur GitHub.
+name: Réveil Supabase
+
+on:
+  schedule:
+    - cron: "17 6 * * *"   # tous les jours vers 7 h - 8 h (heure de Paris)
+  workflow_dispatch:        # bouton « Run workflow » pour tester à la main
+
+jobs:
+  reveil:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Petite requête à la base
+        run: |
+          URL=$(sed -n "s/.*supabaseUrl: *'\([^']*\)'.*/\1/p" config.js)
+          CLE=$(sed -n "s/.*supabaseAnonKey: *'\([^']*\)'.*/\1/p" config.js)
+          if [ -z "$URL" ] || [ -z "$CLE" ]; then echo "config.js est encore vide : rien à réveiller."; exit 0; fi
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL/rest/v1/contacts?select=id&limit=1" -H "apikey: $CLE")
+          echo "Réponse de Supabase : $CODE"
+          [ "$CODE" = "200" ] || { echo "Supabase n'a pas répondu normalement (projet en pause ?)."; exit 1; }
