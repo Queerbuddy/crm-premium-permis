@@ -1,6 +1,7 @@
 // CRM Premium Permis : reçoit tous les formulaires du site (rappel-accueil, rappel,
 // inscription, devis, contact, info-appli, liste-attente, chatbot)
-// (Netlify Forms > Notifications > HTTP POST request) et les range dans le CRM.
+// (Netlify Forms > Notifications > HTTP POST request, ou directement depuis le navigateur
+// avec ?source=site, voir plus bas) et les range dans le CRM.
 //
 // Ce que fait une nouvelle demande (workflow n° 1) :
 //   1. crée la fiche (ou la retrouve si le même téléphone a déjà écrit) ;
@@ -117,18 +118,58 @@ async function envoyerEmail(agence: string, sujet: string, html: string) {
   return r.ok ? `e-mail envoyé à ${a}` : `e-mail refusé (${r.status}) : ${await r.text()}`;
 }
 
+// Envoi direct par le navigateur (site sur Cloudflare Pages) : …/demande-site?source=site
+// Pas de secret possible côté navigateur, donc : origine vérifiée, pot de miel, taille limitée,
+// téléphone ou e-mail obligatoire, 10 envois max par adresse IP et par 10 minutes.
+const ORIGINES = ["https://premiumpermis.fr", "https://www.premiumpermis.fr", "http://localhost:8006",
+  ...env("ORIGINES_EN_PLUS").split(",").map((x) => x.trim()).filter(Boolean)];
+const TAILLE_MAX = 10_000, CHAMP_MAX = 2000;
+const envoisParIp = new Map<string, number[]>();
+const enteteCors = (origine: string | null): Record<string, string> => ({
+  "Access-Control-Allow-Origin": origine && ORIGINES.includes(origine) ? origine : ORIGINES[0],
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "content-type",
+  "Vary": "Origin",
+});
+function tropDEnvois(ip: string) {
+  const maint = Date.now(), liste = (envoisParIp.get(ip) ?? []).filter((t) => maint - t < 10 * 60e3);
+  liste.push(maint);
+  envoisParIp.set(ip, liste);
+  return liste.length > 10;
+}
+
 Deno.serve(async (req) => {
-  if (req.method !== "POST") return new Response("CRM Premium Permis : en attente des formulaires.", { status: 200 });
+  const depuisSite = new URL(req.url).searchParams.get("source") === "site";
+  const origineHttp = req.headers.get("origin");
+  const cors = depuisSite ? enteteCors(origineHttp) : {};
+  const repondre = (texte: string, status = 200) => new Response(texte, { status, headers: { ...cors, "Content-Type": "application/json" } });
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+  if (req.method !== "POST") return new Response("CRM Premium Permis : en attente des formulaires.", { status: 200, headers: cors });
   const corps = await req.text();
-  if (!(await signatureValide(req.headers.get("x-webhook-signature"), corps))) {
-    return new Response("signature invalide", { status: 401 });
-  }
 
   let envoi: Record<string, any>;
-  try {
-    envoi = JSON.parse(corps);
-  } catch {
-    return new Response("contenu illisible", { status: 400 });
+  if (depuisSite) {
+    if (!origineHttp || !ORIGINES.includes(origineHttp)) return repondre('{"erreur":"origine refusée"}', 403);
+    if (corps.length > TAILLE_MAX) return repondre('{"erreur":"trop long"}', 413);
+    const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0].trim() || "inconnue";
+    if (tropDEnvois(ip)) return repondre('{"erreur":"trop d\'envois, réessayez plus tard"}', 429);
+    try { envoi = JSON.parse(corps); } catch { return repondre('{"erreur":"contenu illisible"}', 400); }
+    const brut = envoi?.data;
+    if (!brut || typeof brut !== "object") return repondre('{"erreur":"contenu illisible"}', 400);
+    const propre: Record<string, string> = {};
+    for (const [k, v] of Object.entries(brut).slice(0, 60)) if (v != null) propre[k.slice(0, 60)] = String(v).slice(0, CHAMP_MAX);
+    if ((propre["adresse-bot"] ?? "").trim()) return repondre('{"ok":true}'); // robot : on fait semblant
+    if (!normaliserTel(propre.telephone) && !/\S+@\S+\.\S+/.test(propre.email ?? "")) return repondre('{"erreur":"téléphone ou e-mail obligatoire"}', 400);
+    envoi = { form_name: String(envoi.form_name ?? propre["form-name"] ?? "").slice(0, 60), data: propre };
+  } else {
+    if (!(await signatureValide(req.headers.get("x-webhook-signature"), corps))) {
+      return new Response("signature invalide", { status: 401 });
+    }
+    try {
+      envoi = JSON.parse(corps);
+    } catch {
+      return new Response("contenu illisible", { status: 400 });
+    }
   }
   const d: Record<string, string> = { ...(envoi.data ?? {}) };
   const formulaire: string = envoi.form_name ?? d["form-name"] ?? "rappel";
@@ -172,7 +213,7 @@ Deno.serve(async (req) => {
       prenom, nom, telephone: tel || null, email: d.email || null, formule: d.formule || null,
       agence, source, page: d.page || null, message: d.message || null, ...origine,
     }).select().single();
-    if (error) return new Response("erreur base : " + error.message, { status: 500 });
+    if (error) return new Response("erreur base : " + error.message, { status: 500, headers: cors });
     contact = data;
   } else {
     // Fiche existante : on complète seulement l'origine manquante (la première pub reste celle qui compte).
@@ -228,7 +269,7 @@ Deno.serve(async (req) => {
   );
   await db.from("activites").insert({ contact_id: contact.id, type: "email", texte: resultatEmail, auteur: "CRM" });
 
-  return new Response(JSON.stringify({ ok: true, contact: contact.id }), {
-    headers: { "Content-Type": "application/json" },
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: { ...cors, "Content-Type": "application/json" },
   });
 });
